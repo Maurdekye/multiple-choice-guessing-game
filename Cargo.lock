@@ -41,9 +41,9 @@ checksum = "5b40af805b3121feab8a3c29f04d8ad262fa8e0561883e7653e024ae4479e6de"
 
 [[package]]
 name = "progress-observer"
-version = "3.1.0"
+version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91307e3ace8f7f223ac43a90533ba420fc5f1f2a899feaaaaf2b2d6aa9d9250"
+checksum = "88de611b81856ab5b73819c9d155cdbc3701c4d1bbaf5d1caa71e0083f21822f"
 
 [[package]]
 name = "rand"

@@ -1,12 +1,8 @@
 #![feature(generic_arg_infer)]
 #![feature(stmt_expr_attributes)]
-use progress_observer::{Observer, Options};
+use progress_observer::{reprint, Observer, Options};
 use rand::prelude::*;
-use std::{
-    array,
-    cmp::Ordering,
-    time::{Duration, Instant},
-};
+use std::{array, cmp::Ordering, time::Duration};
 
 #[derive(Debug)]
 struct Quiz<const N: usize, const K: usize> {
@@ -124,32 +120,25 @@ fn test_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
     unreachable!("Loop runs indefinitely")
 }
 
-fn bench_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>() -> f32 {
+fn bench_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>() -> f64 {
     let mut rng = thread_rng();
     let mut total: u128 = 0;
-    let start = Instant::now();
-    let runs = 'bench_loop: {
-        for (i, should_print) in Observer::new_with(
-            Duration::from_secs_f32(0.1),
-            Options {
-                max_checkpoint_size: Some(10000),
-                ..Default::default()
-            },
-        )
-        .enumerate()
-        {
-            total += test_strategy::<N, K, Strategy>(&mut rng) as u128;
-            if should_print {
-                let avg = total as f32 / i as f32;
-                print!("\r{avg:.4}");
-                if Instant::now().duration_since(start).as_secs() > 30 {
-                    break 'bench_loop i;
-                }
-            }
+    let mut trials: u64 = 0;
+    for should_print in Observer::new_with(
+        Duration::from_secs_f64(0.1),
+        Options {
+            run_for: Some(Duration::from_secs(30)),
+            ..Default::default()
+        },
+    ) {
+        total += test_strategy::<N, K, Strategy>(&mut rng) as u128;
+        trials += 1;
+        if should_print {
+            let avg = total as f64 / trials as f64;
+            reprint!("{avg: <20}");
         }
-        unreachable!()
-    };
-    total as f32 / runs as f32
+    }
+    total as f64 / trials as f64
 }
 
 fn main() {
