@@ -564,6 +564,59 @@ fn plot_series(plot_name: &str, series: Vec<Vec<usize>>) {
     }
 }
 
+fn plot_series_f32(plot_name: &str, series: Vec<Vec<f32>>) {
+    let root = BitMapBackend::new(&plot_name, (1024, 1024)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let mut plot = ChartBuilder::on(&root)
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(60)
+        .build_cartesian_2d(
+            0..series.iter().map(|s| s.len()).max().unwrap(),
+            0.0..series
+                .iter()
+                .flatten()
+                .cloned()
+                .reduce(|a, b| a.max(b))
+                .unwrap(),
+        )
+        .unwrap();
+
+    plot.configure_mesh().draw().unwrap();
+
+    for (i, ((datapoints, color), delta_color)) in series
+        .into_iter()
+        .zip(
+            [
+                RED_900, BLUE_900, GREEN_900, YELLOW_900, ORANGE_900, BROWN_900, LIME_900,
+            ]
+            .into_iter()
+            .cycle(),
+        )
+        .zip(
+            [
+                RED_500, BLUE_500, GREEN_500, YELLOW_500, ORANGE_500, BROWN_500, LIME_500,
+            ]
+            .into_iter()
+            .cycle(),
+        )
+        .enumerate()
+    {
+        plot.draw_series(LineSeries::new(
+            datapoints.clone().into_iter().enumerate(),
+            color,
+        ))
+        .unwrap()
+        .label(format!("{i}"));
+
+        // let deltas: Vec<_> = datapoints.array_windows().map(|&[a, b]| b - a).collect();
+        // plot.draw_series(LineSeries::new(deltas.into_iter().enumerate(), delta_color))
+        //     .unwrap();
+
+        root.present().unwrap();
+    }
+}
+
 fn bench_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
     options: Strategy::Options,
 ) -> f64
@@ -591,45 +644,74 @@ where
 }
 
 fn main() {
-    // let (_, bf) = test_strategy::<1000, 32, BruteForce<_, _>>(&mut thread_rng(), true);
-    // let (_, heur_1) = test_strategy::<1000, 32, Heuristic<_, _, 1>>(&mut thread_rng(), true);
-    // let (_, heur_2) = test_strategy::<1000, 32, Heuristic<_, _, 2>>(&mut thread_rng(), true);
-    // let (_, heur_4) = test_strategy::<1000, 32, Heuristic<_, _, 4>>(&mut thread_rng(), true);
-    // let (_, heur_8) = test_strategy::<1000, 32, Heuristic<_, _, 8>>(&mut thread_rng(), true);
-    // let (_, heur_16) = test_strategy::<1000, 32, Heuristic<_, _, 16>>(&mut thread_rng(), true);
-    // let (_, heur_32) = test_strategy::<1000, 32, Heuristic<_, _, 32>>(&mut thread_rng(), true);
-    // plot_series(
-    //     &format!("randomize_1_2_4_8_16_32.png"),
-    //     vec![
-    //         bf.unwrap(),
-    //         heur_1.unwrap(),
-    //         heur_2.unwrap(),
-    //         heur_4.unwrap(),
-    //         heur_8.unwrap(),
-    //         heur_16.unwrap(),
-    //         heur_32.unwrap(),
-    //     ],
-    // );
-
-    // let (_, bf) = test_strategy::<1000, 32, BruteForce<_, _>>(&mut thread_rng(), true);
-    // let (_, heur) = test_strategy::<1000, 32, Heuristic<_, _>>(&mut thread_rng(), true);
-    // let (_, smart_heur) = test_strategy::<1000, 32, SmartHeuristic<_, _>>(&mut thread_rng(), true);
-    // plot_series(
-    //     &format!("bf_heur_smartheur_2.png"),
-    //     vec![
-    //         bf.unwrap(),
-    //         heur.unwrap(),
-    //         smart_heur.unwrap(),
-    //     ],
-    // );
-
     let (_, bf) = test_strategy::<100, 100, BruteForce<_, _>>(&mut thread_rng(), true, ());
     let (_, heur) = test_strategy::<100, 100, Heuristic<_, _>>(&mut thread_rng(), true, None);
     let (_, smart_heur) =
         test_strategy::<100, 100, SmartHeuristic<_, _>>(&mut thread_rng(), true, None);
     plot_series(
-        "new_heur_3.png",
+        "new_heur_4.png",
         vec![bf.unwrap(), heur.unwrap(), smart_heur.unwrap()],
+    );
+}
+
+fn average_datapoints(data: Vec<Vec<usize>>) -> Vec<f32> {
+    let mut arranged = Vec::new();
+    for sample in data {
+        for (i, elem) in sample.into_iter().enumerate() {
+            if i >= arranged.len() {
+                arranged.push(Vec::new());
+            }
+            arranged[i].push(elem);
+        }
+    }
+    arranged
+        .into_iter()
+        .map(|collection| {
+            let len = collection.len();
+            let sum: usize = collection.into_iter().sum();
+            sum as f32 / len as f32
+        })
+        .collect()
+}
+
+#[test]
+fn plot_many_samples_methods() {
+    const N: usize = 100;
+    const K: usize = 100;
+    let samples = 10_000;
+    let count = AtomicUsize::new(0);
+    let datas: Vec<_> = (0..samples)
+        .into_par_iter()
+        .map(|_| {
+            let brute_force = test_strategy::<N, K, BruteForce<_, _>>(&mut thread_rng(), true, ())
+                .1
+                .unwrap();
+            let heur = test_strategy::<N, K, Heuristic<_, _>>(&mut thread_rng(), true, None)
+                .1
+                .unwrap();
+            let smart = test_strategy::<N, K, SmartHeuristic<_, _>>(&mut thread_rng(), true, None)
+                .1
+                .unwrap();
+            reprint!("{}", count.fetch_add(1, atomic::Ordering::SeqCst));
+            (brute_force, heur, smart)
+        })
+        .collect();
+    let (mut bf_datas, mut heur_datas, mut smart_datas) = (Vec::new(), Vec::new(), Vec::new());
+    for (bf_data, heur_data, smart_data) in datas {
+        bf_datas.push(bf_data);
+        heur_datas.push(heur_data);
+        smart_datas.push(smart_data);
+    }
+    println!();
+
+    let bf_avg = average_datapoints(bf_datas);
+    let heur_avg = average_datapoints(heur_datas);
+    let smart_avg = average_datapoints(smart_datas);
+
+    let basename = "bf_heur_smart_avgs";
+    plot_series_f32(
+        &format!("{basename}.png"),
+        vec![bf_avg, heur_avg, smart_avg],
     );
 }
 
@@ -640,17 +722,13 @@ fn plot_several_portions() {
         println!("Generating data for portion {portion}");
         let samples = 10000;
         let count = AtomicUsize::new(0);
-        let mut sums = vec![0; 10_000];
         let smart_datas: Vec<_> = (0..samples)
             .into_par_iter()
             .map(|_| {
-                let result = test_strategy::<100, 100, Heuristic<_, _>>(
-                    &mut thread_rng(),
-                    true,
-                    None,
-                )
-                .1
-                .unwrap();
+                let result =
+                    test_strategy::<100, 100, Heuristic<_, _>>(&mut thread_rng(), true, None)
+                        .1
+                        .unwrap();
                 reprint!("{}", count.fetch_add(1, atomic::Ordering::SeqCst));
                 result
             })
@@ -658,23 +736,14 @@ fn plot_several_portions() {
 
         println!();
 
-        for smart_data in smart_datas {
-            sums.iter_mut()
-                .zip(smart_data)
-                .for_each(|(sums, datapoint)| *sums += datapoint);
-        }
-
-        let sums: Vec<_> = sums
-            .into_iter()
-            .map(|datum| datum as f32 / samples as f32)
-            .collect();
+        let sums = average_datapoints(smart_datas);
 
         let mut writer = csv::Writer::from_path(format!("{basename}.csv")).unwrap();
         for (x, y) in sums.iter().enumerate() {
             writer.serialize((x, y)).unwrap();
         }
 
-        plot_series(&format!("{basename}.png"), vec![sums]);
+        plot_series_f32(&format!("{basename}.png"), vec![sums]);
     }
 }
 
