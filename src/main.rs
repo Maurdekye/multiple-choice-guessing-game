@@ -9,16 +9,20 @@ use plotters::{
 };
 use progress_observer::{reprint, Observer, Options};
 use rand::{distributions::WeightedIndex, prelude::*};
+use rayon::prelude::*;
+use serde::Serialize;
 use std::{
     array,
     cmp::Ordering,
     fmt::Display,
     io::{stdout, Write},
     ops::Neg,
+    panic::catch_unwind,
+    sync::atomic::{self, AtomicUsize},
     time::Duration,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Quiz<const N: usize, const K: usize> {
     answers: [usize; N],
 }
@@ -133,24 +137,26 @@ where
 
     /// choice k for question n: n * K + k
     heuristic: [f32; N * K],
-    portion: usize,
     guesses_evaluated: [usize; N * K],
+    portion: usize,
+    max_correct: usize,
+    rng: StdRng,
 }
 
 impl<const N: usize, const K: usize> Heuristic<N, K>
 where
     [f32; N * K]: Sized,
 {
-    pub fn randomize_some(&mut self, rng: &mut ThreadRng, num_update: usize) {
+    pub fn randomize_some(&mut self, num_update: usize) {
         let random_indexes: Vec<_> = self
             .locked_in
             .iter()
             .enumerate()
             .filter_map(|(i, locked)| (!locked).then_some(i))
             .collect();
-        for &i in random_indexes.choose_multiple(rng, num_update) {
+        for &i in random_indexes.choose_multiple(&mut self.rng, num_update) {
             let heuristic = &self.heuristic[i * K..(i + 1) * K];
-            self.current_guess[i] = rng.sample(WeightedIndex::new(heuristic).unwrap());
+            self.current_guess[i] = self.rng.sample(WeightedIndex::new(heuristic).unwrap());
         }
     }
 }
@@ -223,15 +229,11 @@ impl Iterator for PossibleAdjustments {
 #[cfg(test)]
 mod possible_adjustments_tests;
 
-struct HeuristicOptions {
-    portion: usize,
-}
-
 impl<const N: usize, const K: usize> QuizStrategy<N, K> for Heuristic<N, K>
 where
     [f32; N * K]: Sized,
 {
-    type Options = HeuristicOptions;
+    type Options = Option<StdRng>;
 
     fn new(options: Self::Options) -> Self {
         Self {
@@ -240,7 +242,9 @@ where
             locked_in: [false; N],
             heuristic: [0.5; N * K],
             guesses_evaluated: [0; N * K],
-            portion: options.portion,
+            portion: N * K,
+            max_correct: 0,
+            rng: options.unwrap_or(StdRng::from_entropy()),
         }
     }
 
@@ -249,9 +253,12 @@ where
     }
 
     fn refine(&mut self, correct_answers: usize) {
-        let mut rng = thread_rng();
-
         let mut reverted_guess = false;
+
+        if correct_answers > self.max_correct {
+            self.max_correct = correct_answers;
+            self.portion = ((((N * K) as f32).sqrt() / self.max_correct as f32) as usize).max(1);
+        }
 
         'heuristic_eval: {
             let Some((last_guess, last_correct_count)) = &self.last_guess else {
@@ -326,7 +333,7 @@ where
         if !reverted_guess {
             self.last_guess = Some((self.current_guess.clone(), correct_answers));
         }
-        self.randomize_some(&mut rng, self.portion);
+        self.randomize_some(self.portion);
     }
 }
 
@@ -334,6 +341,7 @@ where
 struct SmartHeuristicLinearRefineParameters<const K: usize> {
     current_testing_question: usize,
     current_answer_index: usize,
+    current_answer_initial_value: usize,
     current_question_answer_order: [usize; K],
     last_correct_count: Option<usize>,
 }
@@ -365,7 +373,7 @@ impl<const N: usize, const K: usize> QuizStrategy<N, K> for SmartHeuristic<N, K>
 where
     [(); N * K]: Sized,
 {
-    type Options = HeuristicOptions;
+    type Options = Option<StdRng>;
 
     fn new(options: Self::Options) -> Self {
         Self {
@@ -391,26 +399,27 @@ where
 
         let Some(linear_refine) = &mut self.linear_refine else {
             self.inner_heuristic.refine(correct_answers);
-            if self.inner_heuristic.portion == 1 {
+            if self.inner_heuristic.portion <= 1 {
                 let current_question_answer_order =
                     get_current_question_test_order(&self.inner_heuristic, 0);
-                let mut linear_refine = SmartHeuristicLinearRefineParameters {
-                    current_testing_question: 0,
+                let mut current_testing_question = 0;
+                while self.inner_heuristic.locked_in[current_testing_question] {
+                    current_testing_question += 1;
+                }
+                let current_answer_initial_value =
+                    self.inner_heuristic.current_guess[current_testing_question];
+                let linear_refine = SmartHeuristicLinearRefineParameters {
+                    current_testing_question,
                     current_answer_index: 0,
+                    current_answer_initial_value,
                     current_question_answer_order,
                     last_correct_count: None,
                 };
-                while self.inner_heuristic.locked_in[linear_refine.current_testing_question] {
-                    linear_refine.current_testing_question += 1;
-                }
                 apply_refined_question(&mut self.inner_heuristic, &linear_refine);
                 self.linear_refine = Some(linear_refine);
             }
             return;
         };
-
-        // println!("{}", self.inner_heuristic);
-        // println!("{linear_refine:#?}");
 
         if linear_refine.current_testing_question >= N {
             return;
@@ -426,8 +435,14 @@ where
 
             match correct_answers.cmp(&last_correct_count) {
                 Ordering::Less => {
-                    linear_refine.current_answer_index -= 1;
-                    apply_refined_question(&mut self.inner_heuristic, &linear_refine);
+                    if linear_refine.current_answer_index == 0 {
+                        self.inner_heuristic.current_guess
+                            [linear_refine.current_testing_question] =
+                            linear_refine.current_answer_initial_value;
+                    } else {
+                        linear_refine.current_answer_index -= 1;
+                        apply_refined_question(&mut self.inner_heuristic, &linear_refine);
+                    }
                     update_correct_count = false;
                 }
                 Ordering::Equal => {
@@ -451,6 +466,8 @@ where
                 &self.inner_heuristic,
                 linear_refine.current_testing_question,
             );
+            linear_refine.current_answer_initial_value =
+                self.inner_heuristic.current_guess[linear_refine.current_testing_question];
         }
 
         apply_refined_question(&mut self.inner_heuristic, &linear_refine);
@@ -465,9 +482,17 @@ fn test_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
     collect: bool,
     options: Strategy::Options,
 ) -> (usize, Option<Vec<usize>>) {
-    let mut datapoints = collect.then(|| Vec::new());
-    let mut strategy = Strategy::new(options);
+    let strategy = Strategy::new(options);
     let quiz = Quiz::<N, K>::new(rng);
+    take_quiz(strategy, quiz, collect)
+}
+
+fn take_quiz<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
+    mut strategy: Strategy,
+    quiz: Quiz<N, K>,
+    collect: bool,
+) -> (usize, Option<Vec<usize>>) {
+    let mut datapoints = collect.then(|| Vec::new());
     let mut iteration = 0;
     let mut highest = 0;
     loop {
@@ -476,7 +501,7 @@ fn test_strategy<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
         if let Some(datapoints) = &mut datapoints {
             datapoints.push(highest);
         }
-        if num_correct == N || iteration >= 10_000 {
+        if num_correct == N {
             break;
         }
         strategy.refine(num_correct);
@@ -495,7 +520,12 @@ fn plot_series(plot_name: &str, series: Vec<Vec<usize>>) {
         .y_label_area_size(60)
         .build_cartesian_2d(
             0..series.iter().map(|s| s.len()).max().unwrap(),
-            0..*series.iter().flatten().max().unwrap(),
+            0..series
+                .iter()
+                .flatten()
+                .cloned()
+                .reduce(|a, b| a.max(b))
+                .unwrap(),
         )
         .unwrap();
 
@@ -593,11 +623,89 @@ fn main() {
     //     ],
     // );
 
-    let (_, bf) = test_strategy::<1000, 32, BruteForce<_, _>>(&mut thread_rng(), true, ());
-    let (_, smart) = test_strategy::<1000, 32, SmartHeuristic<_, _>>(
-        &mut thread_rng(),
-        true,
-        HeuristicOptions { portion: 32 },
+    let (_, bf) = test_strategy::<100, 100, BruteForce<_, _>>(&mut thread_rng(), true, ());
+    let (_, heur) = test_strategy::<100, 100, Heuristic<_, _>>(&mut thread_rng(), true, None);
+    let (_, smart_heur) =
+        test_strategy::<100, 100, SmartHeuristic<_, _>>(&mut thread_rng(), true, None);
+    plot_series(
+        "new_heur_3.png",
+        vec![bf.unwrap(), heur.unwrap(), smart_heur.unwrap()],
     );
-    plot_series("smart_test_2.png", vec![bf.unwrap(), smart.unwrap()]);
+}
+
+#[test]
+fn plot_several_portions() {
+    for portion in [15, 37, 62, 75, 87] {
+        let basename = format!("data_3/heur_{portion}");
+        println!("Generating data for portion {portion}");
+        let samples = 10000;
+        let count = AtomicUsize::new(0);
+        let mut sums = vec![0; 10_000];
+        let smart_datas: Vec<_> = (0..samples)
+            .into_par_iter()
+            .map(|_| {
+                let result = test_strategy::<100, 100, Heuristic<_, _>>(
+                    &mut thread_rng(),
+                    true,
+                    None,
+                )
+                .1
+                .unwrap();
+                reprint!("{}", count.fetch_add(1, atomic::Ordering::SeqCst));
+                result
+            })
+            .collect();
+
+        println!();
+
+        for smart_data in smart_datas {
+            sums.iter_mut()
+                .zip(smart_data)
+                .for_each(|(sums, datapoint)| *sums += datapoint);
+        }
+
+        let sums: Vec<_> = sums
+            .into_iter()
+            .map(|datum| datum as f32 / samples as f32)
+            .collect();
+
+        let mut writer = csv::Writer::from_path(format!("{basename}.csv")).unwrap();
+        for (x, y) in sums.iter().enumerate() {
+            writer.serialize((x, y)).unwrap();
+        }
+
+        plot_series(&format!("{basename}.png"), vec![sums]);
+    }
+}
+
+#[test]
+fn find_smart_heur_failure_case() {
+    for i in 0..100_000 {
+        reprint!("{i}");
+        let quiz = Quiz::<10, 10>::new(&mut thread_rng());
+        if let Err(err) = catch_unwind(|| {
+            take_quiz(
+                SmartHeuristic::new(Some(StdRng::seed_from_u64(0))),
+                quiz.clone(),
+                false,
+            );
+        }) {
+            println!("{err:?}");
+            println!("{quiz:?}");
+            break;
+        }
+    }
+}
+
+#[test]
+fn test_smart_heur() {
+    let quiz: Quiz<10, 10> = Quiz {
+        answers: [2, 6, 5, 7, 2, 4, 0, 9, 7, 3],
+    };
+    let (attempts, _) = take_quiz(
+        SmartHeuristic::new(Some(StdRng::seed_from_u64(0))),
+        quiz,
+        false,
+    );
+    println!("{attempts}");
 }
