@@ -4,12 +4,11 @@
 #![feature(generic_const_exprs)]
 #![feature(array_windows)]
 use plotters::{
-    backend::BitMapBackend, chart::ChartBuilder, drawing::IntoDrawingArea,
-    prelude::full_palette::*, series::LineSeries,
+    backend::BitMapBackend, chart::ChartBuilder, drawing::IntoDrawingArea, element::PathElement, prelude::full_palette::*, series::LineSeries
 };
 use progress_observer::{reprint, Observer, Options};
 use rand::{distributions::WeightedIndex, prelude::*};
-use rayon::prelude::*;
+use rayon::{option, prelude::*};
 use serde::Serialize;
 use std::{
     array,
@@ -19,7 +18,7 @@ use std::{
     ops::Neg,
     panic::catch_unwind,
     sync::atomic::{self, AtomicUsize},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 #[derive(Debug, Clone)]
@@ -365,6 +364,7 @@ struct SmartHeuristic<const N: usize, const K: usize>
 where
     [(); N * K]: Sized,
 {
+    threshold: usize,
     inner_heuristic: Heuristic<N, K>,
     linear_refine: Option<SmartHeuristicLinearRefineParameters<K>>,
 }
@@ -373,11 +373,12 @@ impl<const N: usize, const K: usize> QuizStrategy<N, K> for SmartHeuristic<N, K>
 where
     [(); N * K]: Sized,
 {
-    type Options = Option<StdRng>;
+    type Options = (Option<StdRng>, usize);
 
-    fn new(options: Self::Options) -> Self {
+    fn new((maybe_rng, threshold): Self::Options) -> Self {
         Self {
-            inner_heuristic: Heuristic::new(options),
+            threshold,
+            inner_heuristic: Heuristic::new(maybe_rng),
             linear_refine: None,
         }
     }
@@ -399,7 +400,7 @@ where
 
         let Some(linear_refine) = &mut self.linear_refine else {
             self.inner_heuristic.refine(correct_answers);
-            if self.inner_heuristic.portion <= 1 {
+            if self.inner_heuristic.portion <= self.threshold {
                 let current_question_answer_order =
                     get_current_question_test_order(&self.inner_heuristic, 0);
                 let mut current_testing_question = 0;
@@ -607,7 +608,8 @@ fn plot_series_f32(plot_name: &str, series: Vec<Vec<f32>>) {
             color,
         ))
         .unwrap()
-        .label(format!("{i}"));
+        .label(format!("{i}"))
+        .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
 
         // let deltas: Vec<_> = datapoints.array_windows().map(|&[a, b]| b - a).collect();
         // plot.draw_series(LineSeries::new(deltas.into_iter().enumerate(), delta_color))
@@ -643,76 +645,75 @@ where
     total as f64 / trials as f64
 }
 
-fn main() {
-    let (_, bf) = test_strategy::<100, 100, BruteForce<_, _>>(&mut thread_rng(), true, ());
-    let (_, heur) = test_strategy::<100, 100, Heuristic<_, _>>(&mut thread_rng(), true, None);
-    let (_, smart_heur) =
-        test_strategy::<100, 100, SmartHeuristic<_, _>>(&mut thread_rng(), true, None);
-    plot_series(
-        "new_heur_4.png",
-        vec![bf.unwrap(), heur.unwrap(), smart_heur.unwrap()],
-    );
-}
-
-fn average_datapoints(data: Vec<Vec<usize>>) -> Vec<f32> {
-    let mut arranged = Vec::new();
-    for sample in data {
-        for (i, elem) in sample.into_iter().enumerate() {
-            if i >= arranged.len() {
-                arranged.push(Vec::new());
-            }
-            arranged[i].push(elem);
-        }
-    }
-    arranged
-        .into_iter()
-        .map(|collection| {
-            let len = collection.len();
-            let sum: usize = collection.into_iter().sum();
-            sum as f32 / len as f32
-        })
+fn average_samples(samples: Vec<Vec<usize>>) -> Vec<f32> {
+    let num_points = samples.iter().map(Vec::len).min().unwrap_or(0);
+    (0..num_points)
+        .map(|i| samples.iter().map(|sample| sample[i]).sum::<usize>() as f32 / num_points as f32)
         .collect()
 }
 
-#[test]
-fn plot_many_samples_methods() {
-    const N: usize = 100;
-    const K: usize = 100;
-    let samples = 10_000;
+fn sample_strategy_multithreaded<const N: usize, const K: usize, Strategy: QuizStrategy<N, K>>(
+    samples: usize,
+    options: Strategy::Options,
+) -> Vec<f32>
+where
+    Strategy::Options: Clone + Sync,
+{
     let count = AtomicUsize::new(0);
-    let datas: Vec<_> = (0..samples)
+    let samples: Vec<_> = (0..samples)
         .into_par_iter()
         .map(|_| {
-            let brute_force = test_strategy::<N, K, BruteForce<_, _>>(&mut thread_rng(), true, ())
-                .1
-                .unwrap();
-            let heur = test_strategy::<N, K, Heuristic<_, _>>(&mut thread_rng(), true, None)
-                .1
-                .unwrap();
-            let smart = test_strategy::<N, K, SmartHeuristic<_, _>>(&mut thread_rng(), true, None)
+            let result = test_strategy::<N, K, Strategy>(&mut thread_rng(), true, options.clone())
                 .1
                 .unwrap();
             reprint!("{}", count.fetch_add(1, atomic::Ordering::SeqCst));
-            (brute_force, heur, smart)
+            result
         })
         .collect();
-    let (mut bf_datas, mut heur_datas, mut smart_datas) = (Vec::new(), Vec::new(), Vec::new());
-    for (bf_data, heur_data, smart_data) in datas {
-        bf_datas.push(bf_data);
-        heur_datas.push(heur_data);
-        smart_datas.push(smart_data);
-    }
     println!();
+    average_samples(samples)
+}
 
-    let bf_avg = average_datapoints(bf_datas);
-    let heur_avg = average_datapoints(heur_datas);
-    let smart_avg = average_datapoints(smart_datas);
-
-    let basename = "bf_heur_smart_avgs";
+fn plot_thresholds<const N: usize, const K: usize, const T: usize>(
+    samples: usize,
+    thresholds: [usize; T],
+) where
+    [(); N * K]: Sized,
+{
+    let samples: Vec<_> = thresholds
+        .iter()
+        .map(|threshold| {
+            println!("Sampling threshold {threshold}");
+            sample_strategy_multithreaded::<N, K, SmartHeuristic<_, _>>(samples, (None, *threshold))
+        })
+        .collect();
     plot_series_f32(
-        &format!("{basename}.png"),
+        &format!(
+            "thresholds_{}.png",
+            thresholds.map(|t| format!("{t}")).join("_")
+        ),
+        samples,
+    );
+    println!("Done");
+}
+
+fn plot_many_samples_methods<const N: usize, const K: usize>(samples: usize)
+where
+    [(); N * K]: Sized,
+{
+    println!("Sampling brute force strategy");
+    let bf_avg = sample_strategy_multithreaded::<N, K, BruteForce<_, _>>(samples, ());
+    println!("Sampling simple heuristic strategy");
+    let heur_avg = sample_strategy_multithreaded::<N, K, Heuristic<_, _>>(samples, None);
+    println!("Sampling smart heuristic strategy");
+    let smart_avg = sample_strategy_multithreaded::<N, K, SmartHeuristic<_, _>>(samples, (None, 1));
+    println!("Saving results");
+
+    plot_series_f32(
+        &format!("bf_heur_smart_avgs_{N}_{K}_{samples}.png"),
         vec![bf_avg, heur_avg, smart_avg],
     );
+    println!("Done");
 }
 
 #[test]
@@ -736,7 +737,7 @@ fn plot_several_portions() {
 
         println!();
 
-        let sums = average_datapoints(smart_datas);
+        let sums = average_samples(smart_datas);
 
         let mut writer = csv::Writer::from_path(format!("{basename}.csv")).unwrap();
         for (x, y) in sums.iter().enumerate() {
@@ -754,7 +755,7 @@ fn find_smart_heur_failure_case() {
         let quiz = Quiz::<10, 10>::new(&mut thread_rng());
         if let Err(err) = catch_unwind(|| {
             take_quiz(
-                SmartHeuristic::new(Some(StdRng::seed_from_u64(0))),
+                SmartHeuristic::new((Some(StdRng::seed_from_u64(0)), 1)),
                 quiz.clone(),
                 false,
             );
@@ -772,9 +773,24 @@ fn test_smart_heur() {
         answers: [2, 6, 5, 7, 2, 4, 0, 9, 7, 3],
     };
     let (attempts, _) = take_quiz(
-        SmartHeuristic::new(Some(StdRng::seed_from_u64(0))),
+        SmartHeuristic::new((Some(StdRng::seed_from_u64(0)), 1)),
         quiz,
         false,
     );
     println!("{attempts}");
+}
+
+fn main() {
+    // let (_, bf) = test_strategy::<100, 100, BruteForce<_, _>>(&mut thread_rng(), true, ());
+    // let (_, heur) = test_strategy::<100, 100, Heuristic<_, _>>(&mut thread_rng(), true, None);
+    // let (_, smart_heur) =
+    //     test_strategy::<100, 100, SmartHeuristic<_, _>>(&mut thread_rng(), true, None);
+    // plot_series(
+    //     "new_heur_4.png",
+    //     vec![bf.unwrap(), heur.unwrap(), smart_heur.unwrap()],
+    // );
+
+    // plot_many_samples_methods::<100, 100>(10_000);
+    // plot_thresholds::<100, 100, _>(100_000, [1, 4, 8]);
+    plot_thresholds::<100, 100, _>(100_000, [3, 4, 5]);
 }
